@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""gamerun-uiflow - drive a game's menus from a small text file, for unattended benchmarks.
+
+  gamerun-uiflow FLOW_FILE [--dry-run]
+
+Meant to be used as a gamerun hook (hook=gamerun-uiflow ~/.config/gamerun/flows/mygame.flow), but it
+also runs standalone. One command per line, '#' starts a comment, arguments may be quoted:
+
+  set KEY VALUE              settings (see below)
+  process REGEX [TIMEOUT]    wait until a process whose name matches REGEX exists (no X tools needed)
+  window REGEX [TIMEOUT]     wait for a visible window whose title matches REGEX; later steps use it
+  move X Y                   move that window to X,Y
+  at SECONDS                 wait until SECONDS after the flow started (e.g. "at 34" before skipping intros)
+  sleep SECONDS
+  key KEY [COUNT] [GAP]      press a single key COUNT times, GAP s apart, only if the game window has focus
+  click X Y                  left-click at X,Y relative to the window's top-left corner
+  expect NAME REF CROP [THRESHOLD] [TIMEOUT]
+                             take screenshots until the window region CROP (WxH+X+Y) matches image REF
+                             (RMSE below THRESHOLD, default 0.08); fail after TIMEOUT s (default 180)
+  screenshot NAME [CROP]     save a screenshot of the window (or a region) as NAME.png
+  mark NAME                  `gamerun mark NAME` (benchmark windows, timing)
+  quit REGEX                 send SIGTERM to processes whose name matches REGEX
+  log TEXT
+
+Settings (set KEY VALUE):
+  xdotool CMD       how to run xdotool, default "xdotool"; e.g. "toolbox run -c mybox xdotool"
+  screenshot CMD    full-screen screenshot command with {out} for the file; default: first of
+                    spectacle (KDE), grim (wlroots), gnome-screenshot, import (X11) that exists
+  refs DIR          directory for relative REF paths (default: the flow file's directory)
+  threshold N       default RMSE threshold for expect
+  on_fail REGEX     quit processes matching REGEX if a step fails (so a batch can continue)
+  allow_chords yes  permit key combinations like ctrl+s (refused by default: a synthetic Alt+F4 sent
+                    through XWayland once switched the whole session to another virtual terminal)
+
+Images: ImageMagick (`magick`, or `convert`/`compare` from version 6). Output: $GAMERUN_RUN/uiflow/
+(or ./uiflow-out), plus a log on stdout. Exit status 0 = every step succeeded, so gamerun records
+hook_status=ok. Stdlib only.
+"""
+import os, re, shlex, shutil, signal, subprocess, sys, time
+
+T0 = time.monotonic()
+S = {'xdotool': 'xdotool', 'screenshot': None, 'refs': None, 'threshold': '0.08', 'on_fail': '',
+     'allow_chords': 'no'}
+OUT = os.path.join(os.environ['GAMERUN_RUN'], 'uiflow') if os.environ.get('GAMERUN_RUN') else os.path.abspath('uiflow-out')
+WIN = None
+DRY = False
+
+
+class StepFailed(Exception):
+    pass
+
+
+def log(msg):
+    print(f'[uiflow {time.strftime("%H:%M:%S")} +{time.monotonic() - T0:6.1f}s] {msg}', flush=True)
+
+
+def run(cmd, timeout=30, check=False):
+    """Run a command line (string, shell-split) and return stdout ('' on failure)."""
+    if DRY:
+        log(f'(dry-run) {cmd}')
+        return ''
+    try:
+        p = subprocess.run(shlex.split(cmd) if isinstance(cmd, str) else cmd, capture_output=True, text=True,
+                           timeout=timeout, stdin=subprocess.DEVNULL)
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        if check:
+            raise StepFailed(f'{cmd}: {e}')
+        return ''
+    if p.returncode and check:
+        raise StepFailed(f'{cmd}: exit {p.returncode}: {p.stderr.strip()[:300]}')
+    if p.stderr.strip() and p.returncode:
+        log(f'  stderr: {p.stderr.strip()[:200]}')
+    return p.stdout
+
+
+def xdo(args, check=False):
+    return run(f"{S['xdotool']} {args}", check=check)
+
+
+def vt():
+    try:
+        return open('/sys/class/tty/tty0/active').read().strip()
+    except OSError:
+        return ''
+
+
+VT0 = vt()
+
+
+def screenshot_cmd():
+    if S['screenshot']:
+        return S['screenshot']
+    for exe, tmpl in (('spectacle', 'spectacle -b -n -f -o {out}'), ('grim', 'grim {out}'),
+                      ('gnome-screenshot', 'gnome-screenshot -f {out}'), ('import', 'import -window root {out}')):
+        if shutil.which(exe):
+            S['screenshot'] = tmpl
+            return tmpl
+    raise StepFailed('no screenshot tool found (set screenshot CMD)')
+
+
+def im(*args):
+    """ImageMagick 7 (magick) or 6 (convert/compare)."""
+    if shutil.which('magick'):
+        return ['magick'] + list(args)
+    if args and args[0] == 'compare':
+        return list(args)
+    return ['convert'] + list(args)
+
+
+def geometry():
+    if WIN is None:
+        raise StepFailed('no window yet (use "window REGEX" first)')
+    out = xdo(f'getwindowgeometry --shell {WIN}')
+    g = dict(l.split('=', 1) for l in out.split() if '=' in l)
+    try:
+        return int(g['X']), int(g['Y']), int(g['WIDTH']), int(g['HEIGHT'])
+    except (KeyError, ValueError):
+        raise StepFailed(f'could not read window geometry for {WIN}: {out.strip()[:100]}')
+
+
+def shot(name, crop=None):
+    full = os.path.join(OUT, '_full.png')
+    run(screenshot_cmd().format(out=full), timeout=20)
+    if DRY:
+        return os.path.join(OUT, f'{name}.png')
+    if not os.path.exists(full):
+        raise StepFailed('screenshot failed')
+    x, y, w, h = geometry()
+    dst = os.path.join(OUT, f'{name}.png')
+    region = f'{w}x{h}+{x}+{y}'
+    subprocess.run(im(full, '-crop', region, '+repage', dst), capture_output=True)
+    if crop:
+        subprocess.run(im(dst, '-crop', crop, '+repage', dst), capture_output=True)
+    os.remove(full)
+    return dst
+
+
+def rmse(a, b):
+    p = subprocess.run(im('compare', '-metric', 'RMSE', a, b, 'null:'), capture_output=True, text=True)
+    m = re.search(r'\(([\d.e+-]+)\)', p.stderr)
+    return float(m.group(1)) if m else 1.0
+
+
+def find_procs(regex):
+    rx = re.compile(regex, re.I)
+    out = []
+    for d in os.listdir('/proc'):
+        if d.isdigit() and int(d) != os.getpid():
+            try:
+                comm = open(f'/proc/{d}/comm').read().strip()
+            except OSError:
+                continue
+            if rx.search(comm):
+                out.append(int(d))
+    return out
+
+
+def ref_path(r):
+    r = os.path.expanduser(os.path.expandvars(r))
+    return r if os.path.isabs(r) else os.path.join(S['refs'], r)
+
+
+# ---------------------------------------------------------------- steps
+def step(cmd, a):
+    global WIN
+    if cmd == 'set':
+        k, v = a[0], ' '.join(a[1:])
+        if k not in S:
+            raise StepFailed(f'unknown setting {k}')
+        S[k] = os.path.expanduser(os.path.expandvars(v)) if k == 'refs' else v
+    elif cmd == 'log':
+        log(' '.join(a))
+    elif cmd == 'sleep':
+        time.sleep(0 if DRY else float(a[0]))
+    elif cmd == 'at':
+        wait = float(a[0]) - (time.monotonic() - T0)
+        if wait > 0 and not DRY:
+            time.sleep(wait)
+    elif cmd == 'process':
+        timeout = float(a[1]) if len(a) > 1 else 300
+        end = time.monotonic() + timeout
+        while not DRY and not find_procs(a[0]):
+            if time.monotonic() > end:
+                raise StepFailed(f'no process matching {a[0]} after {timeout:g} s')
+            time.sleep(1)
+        log(f'process {a[0]} found')
+    elif cmd == 'window':
+        timeout = float(a[1]) if len(a) > 1 else 300
+        end = time.monotonic() + timeout
+        while True:
+            ids = xdo(f'search --onlyvisible --name {shlex.quote(a[0])}').split()
+            if ids or DRY:
+                WIN = ids[0] if ids else '0'
+                break
+            if time.monotonic() > end:
+                raise StepFailed(f'no window matching {a[0]!r} after {timeout:g} s (check xdotool access: {S["xdotool"]})')
+            time.sleep(2)
+        log(f'window {a[0]!r} = {WIN}')
+    elif cmd == 'move':
+        xdo(f'windowmove {WIN} {int(a[0])} {int(a[1])}')
+    elif cmd == 'key':
+        key, count, gap = a[0], int(a[1]) if len(a) > 1 else 1, float(a[2]) if len(a) > 2 else 1.0
+        if '+' in key and S['allow_chords'] != 'yes':
+            raise StepFailed(f'refusing key chord {key!r} (set allow_chords yes to permit)')
+        if vt() != VT0:
+            raise StepFailed('virtual terminal changed; not sending keys')
+        active = xdo('getactivewindow').strip()
+        if not DRY and active != WIN:
+            log(f'game window not focused (active {active or "?"}); key {key} not sent')
+            return
+        for i in range(count):
+            xdo(f'key --clearmodifiers {shlex.quote(key)}')
+            if i < count - 1 and not DRY:
+                time.sleep(gap)
+        if vt() != VT0:
+            raise StepFailed('virtual terminal changed after sending keys; stopping')
+    elif cmd == 'click':
+        x, y, _, _ = geometry() if not DRY else (0, 0, 0, 0)
+        xdo(f'mousemove {x + int(a[0])} {y + int(a[1])}')
+        time.sleep(0 if DRY else 0.3)
+        xdo('click 1')
+    elif cmd == 'expect':
+        name, ref, crop = a[0], ref_path(a[1]), a[2]
+        thr = float(a[3]) if len(a) > 3 else float(S['threshold'])
+        timeout = float(a[4]) if len(a) > 4 else 180
+        if not DRY and not os.path.exists(ref):
+            raise StepFailed(f'reference image {ref} not found')
+        end = time.monotonic() + timeout
+        while True:
+            img = shot(name, crop)
+            d = 0.0 if DRY else rmse(ref, img)
+            if d < thr:
+                log(f'expect {name}: matched (rmse {d:.4f} < {thr})')
+                break
+            if time.monotonic() > end:
+                raise StepFailed(f'expect {name}: no match within {timeout:g} s (last rmse {d:.4f}, threshold {thr})')
+            time.sleep(2)
+    elif cmd == 'screenshot':
+        log(f'screenshot {shot(a[0], a[1] if len(a) > 1 else None)}')
+    elif cmd == 'mark':
+        run(['gamerun', 'mark', a[0]])
+        log(f'mark {a[0]}')
+    elif cmd == 'quit':
+        pids = find_procs(a[0])
+        for pid in pids:
+            if not DRY:
+                os.kill(pid, signal.SIGTERM)
+        log(f'quit {a[0]}: SIGTERM to {pids or "nothing"}')
+    else:
+        raise StepFailed(f'unknown command {cmd!r}')
+
+
+def main():
+    global DRY
+    args = [x for x in sys.argv[1:] if x != '--dry-run']
+    DRY = '--dry-run' in sys.argv[1:]
+    if len(args) != 1 or args[0] in ('-h', '--help'):
+        print(__doc__)
+        return 0 if args and args[0] in ('-h', '--help') else 2
+    flow = os.path.expanduser(args[0])
+    S['refs'] = os.path.dirname(os.path.abspath(flow))
+    os.makedirs(OUT, exist_ok=True)
+    lines = open(flow).read().splitlines()
+    log(f'flow {flow} ({len(lines)} lines), output {OUT}{" [dry-run]" if DRY else ""}')
+    for n, raw in enumerate(lines, 1):
+        line = raw.split('#', 1)[0].strip() if not raw.strip().startswith('set screenshot') else raw.strip()
+        if not line:
+            continue
+        parts = shlex.split(line)
+        try:
+            step(parts[0], parts[1:])
+        except (StepFailed, IndexError, ValueError) as e:
+            log(f'FAILED at line {n} ({line}): {e}')
+            if S['on_fail']:
+                for pid in find_procs(S['on_fail']):
+                    os.kill(pid, signal.SIGTERM)
+                log(f'on_fail: SIGTERM to processes matching {S["on_fail"]}')
+            return 1
+    log('flow finished')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

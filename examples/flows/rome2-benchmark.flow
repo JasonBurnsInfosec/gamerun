@@ -1,0 +1,36 @@
+# Total War: ROME II - Emperor Edition: built-in "forest" benchmark, then quit.
+# Experiment:  hook=gamerun-uiflow ~/.config/gamerun/flows/rome2-benchmark.flow
+#              bench_window=auto:112        (the benchmark is 1:52 long and follows a loading screen)
+# Needs: windowed 2560x1440 (preferences.script.txt: gfx_fullscreen false; x_res 2560; y_res 1440),
+# and two reference crops you take once from your own screen (see README, "Writing a flow"):
+#   menu_ref.png  = 70x400+0+520 of the main menu (the left icon column)
+#   adv_ref.png   = 840x720+860+390 of Options > Graphics > Advanced Options
+# Coordinates are relative to the game window at 2560x1440.
+
+set on_fail "Rome2\.exe"
+# xdotool lives in a toolbox container on the author's system; plain "xdotool" is the default.
+# set xdotool toolbox run -c gamescope-dev xdotool
+
+window "ROME 2"
+move 0 0
+at 34                     # the intro ignores earlier key presses
+key Escape 3 1            # skip the intro movies (plain key, sent only if the game has focus)
+expect menu menu_ref.png 70x400+0+520
+sleep 6                   # let the menu settle; earlier clicks are ignored
+click 34 684              # Options (gear)
+sleep 2
+click 220 583             # Graphics
+sleep 3
+click 1280 488            # Advanced Options
+sleep 3
+expect advanced adv_ref.png 840x720+860+390 0.08 20
+click 1280 1010           # Run Benchmark
+sleep 3
+click 920 554             # "forest"
+sleep 1
+click 1244 944            # confirm
+mark bench_click
+sleep 135                 # ~10 s loading + 112 s benchmark + margin
+mark bench_done
+screenshot summary 900x600+840+280   # the game's own Average FPS screen, kept as evidence
+quit "Rome2\.exe"

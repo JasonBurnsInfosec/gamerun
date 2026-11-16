@@ -1,0 +1,16 @@
+# Generic timed capture: no menus, no X tools. Wait for the game process, let it settle,
+# record a fixed stretch between two markers, then quit. Useful for:
+#  - games with a command-line benchmark mode (add the flag with args= in the experiment)
+#  - idle/attract scenes or a fixed spot you load into automatically
+#  - consistent fixed-length captures of anything
+# Experiment:  hook=gamerun-uiflow ~/.config/gamerun/flows/timed-capture.flow
+#              bench_window=markers:capture_start:capture_end
+# Edit the process name and timings for your game.
+
+set on_fail "MyGame"
+process "MyGame" 300        # regex on the process name (Proton games: the .exe name, e.g. Game\.exe)
+sleep 60                  # loading, shader compilation, settling
+mark capture_start
+sleep 120                 # the measured stretch
+mark capture_end
+quit "MyGame"

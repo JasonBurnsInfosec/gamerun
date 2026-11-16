@@ -1,0 +1,462 @@
+#!/usr/bin/env bash
+# gamerun - Steam launch wrapper for repeatable Linux gaming experiments.
+#
+# Set a game's Steam launch options once:   /home/<you>/.local/bin/gamerun %command%
+# then pick what each launch does from the terminal:
+#
+#   gamerun new <name>        create an experiment file from the template
+#   gamerun use <name>        make <name> the active experiment
+#   gamerun off               deactivate (launches pass straight through)
+#   gamerun status            show the active experiment
+#   gamerun label [name]      print the label of the active (or named) experiment
+#   gamerun list              list experiments
+#   gamerun runs [filter]     list recorded runs (in-progress runs too), with avg FPS if windowed
+#   gamerun last              print the newest run directory (including one still running)
+#   gamerun edit <name>       open an experiment in $EDITOR
+#   gamerun mark <name>       record a timestamped marker in the current run (for hooks/scripts)
+#   gamerun compare LABEL...  benchsum over every run with these labels (first = baseline)
+#                             [--appid ID] [-- extra benchsum args]
+#   gamerun batch EXP...      launch the game repeatedly through Steam, one run per slot
+#                             --appid ID [-n N] [--order abba|alternate|block] [--timeout S] [--cooldown S] [--dry-run]
+#                             (something must end each game session: a hook=, or you)
+#
+# With an active experiment, each launch gets a run directory containing manifest.json
+# (game, Proton, driver, kernel, power profile, env applied, sync mode, exit code, duration),
+# MangoHud frametime logs, optional threadwatch / gputaskman / Proton logs, and summaries
+# from benchsum and threadwatch (over the benchmark window if bench_window is set).
+# Every finished run is also appended to <results>/index.csv. Without an active experiment,
+# gamerun just execs the game.
+#
+# Config:  ${XDG_CONFIG_HOME:-~/.config}/gamerun/{experiments/*.conf,active}
+# Results: ${GAMERUN_RESULTS:-~/linux-gaming-dev/runs}/<appid>-<game>/<timestamp>_<label>/
+
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/gamerun"
+EXP_DIR="$CONF_DIR/experiments"
+ACTIVE="$CONF_DIR/active"
+RESULTS="${GAMERUN_RESULTS:-$HOME/linux-gaming-dev/runs}"
+SELF="$(readlink -f "$0")"
+SELF_DIR="$(dirname "$SELF")"
+CLEAN_PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+BENCHSUM="${GAMERUN_BENCHSUM:-$HOME/.local/bin/benchsum}"
+THREADWATCH="${GAMERUN_THREADWATCH:-$HOME/.local/bin/threadwatch}"
+
+die() { echo "gamerun: $*" >&2; exit 1; }
+# Run a helper without Steam's LD_PRELOAD/LD_LIBRARY_PATH (not even for the env binary itself).
+clean() { ( unset LD_PRELOAD LD_LIBRARY_PATH; exec env -i HOME="$HOME" PATH="$CLEAN_PATH" "$@" ); }
+
+template() {
+cat <<'EOF'
+# gamerun experiment. Lines: key=value, or "env NAME=VALUE" to export into the game.
+# Runs with the same label are treated as repeats of one configuration by benchsum.
+label=baseline
+notes=
+
+# MangoHud frametime logging (CSV, one row per frame)
+mangohud=1
+mangohud_autostart=1      # 1 = log from 1 s after start until exit; 0 = toggle logging with Shift_R+F2
+mangohud_overlay=0        # 1 = show the HUD; 0 = HUD drawn fully transparent (logging needs it loaded)
+
+# Which part of the log is the benchmark (used for summary.txt, window.json, threadwatch summary):
+#   auto:D[:MS]  a D-second benchmark right after the last loading stall (frame > MS ms, default 250)
+#   A-B          log seconds A to B
+#   markers:S:E  between `gamerun mark S` and `gamerun mark E` (e.g. from a hook)
+# bench_window=auto:112
+
+# threadwatch per-thread CPU sampling of the game process
+threadwatch=1
+threadwatch_name=         # regex on process name, e.g. Rome2\.exe ; empty = busiest .exe
+threadwatch_interval=0.25
+threadwatch_also=wineserver   # also record these processes (regex; empty = none)
+threadwatch_syscalls=0        # >0: sample what the hot threads are blocked in, at this rate (Hz, e.g. 1000)
+
+# gputaskman GPU snapshots (1/s)
+gtm=0
+
+# Proton's own log (large; turn on when debugging, not when benchmarking)
+proton_log=0
+
+# Command rewrites (optional):
+# replace=launcher/launcher.exe=>Rome2.exe   # substring swap in every argument; repeatable
+# args=-some -extra flags                    # appended to the command, split on whitespace
+
+# Temporary file edits for this run only (restored when the game exits); repeatable.
+# PATH::LINE appends LINE to PATH. %compatdata% = the game's Proton prefix directory.
+# file_append=%compatdata%/pfx/drive_c/users/steamuser/AppData/Roaming/Some Game/settings.txt::threads 2;
+
+# Scripts started after launch (killed when the game exits); repeatable. They get GAMERUN_RUN,
+# GAMERUN_APPID, GAMERUN_LABEL, GAMERUN_EXPERIMENT and the display variables. Use them to drive
+# a benchmark and to call `gamerun mark NAME`.
+# hook=$HOME/.config/gamerun/hooks/mygame-benchmark.sh
+
+# Thread affinity rewrites (optional; needs repin_name or threadwatch_name). A thread whose
+# allowed-CPU list equals FROM exactly is moved to TO (checked every 0.5 s; log in repin.log):
+# repin=0-1=>0,16
+# repin_name=^rome2\.exe$
+
+# Environment for the game, e.g.:
+# env WINE_CPU_TOPOLOGY=4:0,1,2,3
+# env PROTON_NO_NTSYNC=1
+EOF
+}
+
+conf_get() {  # conf_get FILE KEY DEFAULT
+    local v
+    v=$(sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*//p" "$1" | tail -1 | sed 's/[[:space:]]#.*$//; s/^#.*$//; s/[[:space:]]*$//')
+    echo "${v:-$3}"
+}
+conf_all() {  # conf_all FILE KEY  -> every value of a repeatable key, one per line (comments not stripped)
+    sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$2" | sed 's/[[:space:]]*$//'
+}
+
+active_name() { [ -f "$ACTIVE" ] && head -1 "$ACTIVE" | tr -d '[:space:]'; }
+# Run directories sorted by their timestamp name (not full path: other folders such as runs/aborted
+# must neither sort last nor count as runs).
+run_dirs() { find "$RESULTS" -mindepth 2 -maxdepth 2 -type d -path "$RESULTS/[0-9]*-*/2*_*" -printf '%f\t%p\n' 2>/dev/null | sort | cut -f2; }
+json_get() { sed -n "s/.*\"$2\": *\"\{0,1\}\([^\",]*\)\"\{0,1\}.*/\1/p" "$1" | head -1; }   # flat manifest values only
+
+# ------------------------------------------------------------------ management commands
+case "${1:-}" in
+    new)
+        [ -n "${2:-}" ] || die "usage: gamerun new <name>"
+        mkdir -p "$EXP_DIR"; f="$EXP_DIR/$2.conf"
+        [ -e "$f" ] && die "$f already exists"
+        template | sed "s/^label=baseline/label=$2/" > "$f"; echo "$f"; exit 0 ;;
+    use)
+        [ -f "$EXP_DIR/${2:-}.conf" ] || die "no experiment '${2:-}' (gamerun list)"
+        echo "$2" > "$ACTIVE"; echo "active: $2 (label=$(conf_get "$EXP_DIR/$2.conf" label "$2"))"; exit 0 ;;
+    off)
+        rm -f "$ACTIVE"; echo "gamerun off: launches pass straight through"; exit 0 ;;
+    status)
+        n=$(active_name)
+        if [ -z "$n" ]; then echo "inactive (pass-through)"; else echo "active: $n"; grep -vE '^\s*(#|$)' "$EXP_DIR/$n.conf"; fi
+        exit 0 ;;
+    label)
+        n=${2:-$(active_name)}; [ -n "$n" ] && [ -f "$EXP_DIR/$n.conf" ] || die "no experiment '${n}'"
+        conf_get "$EXP_DIR/$n.conf" label "$n"; exit 0 ;;
+    list)
+        n=$(active_name); for f in "$EXP_DIR"/*.conf; do [ -e "$f" ] || continue; b=$(basename "$f" .conf)
+            printf '%s %-20s label=%s\n' "$([ "$b" = "$n" ] && echo '*' || echo ' ')" "$b" "$(conf_get "$f" label "$b")"; done
+        exit 0 ;;
+    edit)
+        [ -f "$EXP_DIR/${2:-}.conf" ] || die "no experiment '${2:-}'"; exec "${EDITOR:-nano}" "$EXP_DIR/$2.conf" ;;
+    runs)
+        run_dirs | while read -r d; do
+            [ -n "${2:-}" ] && [[ "$d" != *"$2"* ]] && continue
+            m="$d/manifest.json"
+            if [ -f "$m" ]; then
+                fps=""; [ -f "$d/window.json" ] && fps="  avg=$(json_get "$d/window.json" avg_fps)fps"
+                sync=$(json_get "$m" sync); [ -n "$sync" ] && sync="  sync=$sync"
+                printf '%s  exit=%s  %ss%s%s\n' "${d#"$RESULTS"/}" "$(json_get "$m" exit_code)" "$(json_get "$m" duration_s)" "$sync" "$fps"
+            else
+                printf '%s  (running or aborted)\n' "${d#"$RESULTS"/}"
+            fi
+        done; exit 0 ;;
+    last)
+        run_dirs | tail -1; exit 0 ;;
+    mark)
+        [ -n "${2:-}" ] || die "usage: gamerun mark <name>"
+        run=${GAMERUN_RUN:-}
+        if [ -z "$run" ]; then  # newest run that is still in progress
+            run=$(run_dirs | tail -1); [ -n "$run" ] && [ ! -f "$run/manifest.json" ] || die "no run in progress (set GAMERUN_RUN)"
+        fi
+        printf '%s %s\n' "$(date +%s.%N)" "$2" >> "$run/markers.tsv"; exit 0 ;;
+    compare)
+        shift; appid=""; labels=(); extra=()
+        while [ $# -gt 0 ]; do case "$1" in
+            --appid) appid=$2; shift 2 ;;
+            --) shift; extra=("$@"); break ;;
+            *) labels+=("$1"); shift ;; esac; done
+        [ ${#labels[@]} -gt 0 ] || die "usage: gamerun compare LABEL... [--appid ID] [-- benchsum args]"
+        dirs=()
+        while read -r d; do
+            [ -f "$d/manifest.json" ] || continue
+            [ -n "$appid" ] && [[ "$(basename "$(dirname "$d")")" != "$appid"-* ]] && continue
+            l=$(json_get "$d/manifest.json" label)
+            for want in "${labels[@]}"; do [ "$l" = "$want" ] && dirs+=("$d"); done
+        done < <(run_dirs)
+        [ ${#dirs[@]} -gt 0 ] || die "no finished runs with labels: ${labels[*]}"
+        exec "$BENCHSUM" "${dirs[@]}" --baseline "${labels[0]}" "${extra[@]}" ;;
+    batch)
+        shift; appid=""; n=1; order=abba; timeout=900; cooldown=15; exps=(); dry=0
+        while [ $# -gt 0 ]; do case "$1" in
+            --appid) appid=$2; shift 2 ;; -n) n=$2; shift 2 ;; --order) order=$2; shift 2 ;; --dry-run) dry=1; shift ;;
+            --timeout) timeout=$2; shift 2 ;; --cooldown) cooldown=$2; shift 2 ;;
+            *) [ -f "$EXP_DIR/$1.conf" ] || die "no experiment '$1'"; exps+=("$1"); shift ;; esac; done
+        [ -n "$appid" ] && [ ${#exps[@]} -gt 0 ] || die "usage: gamerun batch EXP... --appid ID [-n N] [--order abba|alternate|block]"
+        command -v steam >/dev/null || die "steam not found"
+        slots=(); k=${#exps[@]}
+        case "$order" in
+            block)     for e in "${exps[@]}"; do for _ in $(seq "$n"); do slots+=("$e"); done; done ;;
+            alternate) for _ in $(seq "$n"); do slots+=("${exps[@]}"); done ;;
+            abba)      for r in $(seq 0 $((n - 1))); do   # forward, backward, forward... cancels drift
+                           if [ $((r % 2)) = 0 ]; then slots+=("${exps[@]}"); else for ((i = k - 1; i >= 0; i--)); do slots+=("${exps[$i]}"); done; fi
+                       done ;;
+            *) die "unknown --order $order" ;;
+        esac
+        echo "gamerun batch: ${#slots[@]} runs, order: ${slots[*]}"
+        [ "$dry" = 1 ] && exit 0
+        prev=$(active_name)
+        trap '[ -n "$prev" ] && echo "$prev" > "$ACTIVE"' EXIT
+        i=0
+        for e in "${slots[@]}"; do
+            i=$((i + 1)); echo "$e" > "$ACTIVE"
+            before=$(run_dirs)
+            echo "[$(date +%T)] $i/${#slots[@]}: $e"
+            steam -applaunch "$appid" >/dev/null 2>&1 &
+            t0=$(date +%s); run=""
+            while [ $(( $(date +%s) - t0 )) -lt "$timeout" ]; do
+                sleep 5
+                # the new run is a directory that did not exist before this launch
+                [ -z "$run" ] && run=$(run_dirs | grep -vxF -f <(printf '%s\n' "$before") | grep -F "/$appid-" | tail -1)
+                [ -n "$run" ] && [ -f "$run/manifest.json" ] && break
+            done
+            [ -n "$run" ] && [ -f "$run/manifest.json" ] || die "slot $i ($e): no finished run within ${timeout}s; stopping (${run:-no run dir})"
+            printf '    %s  exit=%s%s\n' "$(basename "$run")" "$(json_get "$run/manifest.json" exit_code)" \
+                "$([ -f "$run/window.json" ] && echo "  avg=$(json_get "$run/window.json" avg_fps) fps")"
+            sleep "$cooldown"
+        done
+        exit 0 ;;
+    ""|-h|--help|help)
+        sed -n '2,/^$/s/^# \{0,1\}//p' "$0"; exit 0 ;;
+esac
+
+# ------------------------------------------------------------------ launch
+NAME=$(active_name)
+if [ -z "$NAME" ] || [ ! -f "$EXP_DIR/$NAME.conf" ]; then
+    exec "$@"   # inactive: zero overhead
+fi
+EXP="$EXP_DIR/$NAME.conf"
+
+APPID="${SteamAppId:-${SteamGameId:-0}}"
+GAME=""
+for lib in "$HOME/.local/share/Steam/steamapps" $(sed -n 's/.*"path"[[:space:]]*"\(.*\)".*/\1\/steamapps/p' \
+        "$HOME/.local/share/Steam/steamapps/libraryfolders.vdf" 2>/dev/null); do
+    [ -f "$lib/appmanifest_$APPID.acf" ] && GAME=$(sed -n 's/^[[:space:]]*"name"[[:space:]]*"\(.*\)"/\1/p' "$lib/appmanifest_$APPID.acf" | head -1) && break
+done
+SLUG=$(printf '%s' "${GAME:-app}" | tr -cs '[:alnum:]' '-' | sed 's/^-//; s/-$//' | cut -c1-40)
+LABEL=$(conf_get "$EXP" label "$NAME")
+STAMP=$(date +%Y%m%d-%H%M%S)
+RUN="$RESULTS/$APPID-$SLUG/${STAMP}_$(printf '%s' "$LABEL" | tr -cs '[:alnum:]._-' '-')"
+mkdir -p "$RUN" || exec "$@"     # never block the game on our own failures
+LOG="$RUN/gamerun.log"
+log() { echo "[$(date +%T)] $*" >> "$LOG"; }
+cp "$EXP" "$RUN/experiment.conf"
+log "experiment=$NAME label=$LABEL appid=$APPID game=$GAME"
+log "command: $*"
+
+# Command rewrites: "replace=FROM=>TO" (substring, every argument; repeatable) and
+# "args=..." (extra arguments appended, split on whitespace).
+CMD=("$@")
+while IFS= read -r rule; do
+    from=${rule%%=>*}; to=${rule#*=>}
+    [ -n "$from" ] && [ "$rule" != "$from" ] || continue
+    for i in "${!CMD[@]}"; do CMD[$i]=${CMD[$i]//"$from"/"$to"}; done
+    log "replace '$from' => '$to'"
+done < <(conf_all replace "$EXP")
+EXTRA=$(conf_get "$EXP" args "")
+if [ -n "$EXTRA" ]; then read -r -a extra_arr <<< "$EXTRA"; CMD+=("${extra_arr[@]}"); log "args: $EXTRA"; fi
+set -- "${CMD[@]}"
+[ "${#CMD[@]}" -gt 0 ] && log "final command: $*"
+
+# Environment for the game
+ENV_APPLIED=()
+while IFS= read -r line; do
+    kv=${line#env }; kv=${kv%%#*}; kv=$(echo "$kv" | sed 's/[[:space:]]*$//')
+    [[ "$kv" == *=* ]] || continue
+    export "${kv?}"; ENV_APPLIED+=("$kv"); log "env $kv"
+done < <(grep -E '^[[:space:]]*env[[:space:]]+' "$EXP" | sed 's/^[[:space:]]*//')
+
+# Temporary file edits (file_append=PATH::LINE): back up each file once, append, restore at exit.
+COMPAT="${STEAM_COMPAT_DATA_PATH:-$HOME/.local/share/Steam/steamapps/compatdata/$APPID}"
+APPENDED=(); declare -A BACKUP=()
+restore_files() {
+    local f
+    for f in "${!BACKUP[@]}"; do
+        if [ "${BACKUP[$f]}" = "-" ]; then rm -f "$f"; else cp -p "${BACKUP[$f]}" "$f"; fi
+        log "restored $f"
+    done
+    BACKUP=()
+}
+trap restore_files EXIT
+n=0
+while IFS= read -r spec; do
+    [[ "$spec" == *::* ]] || { log "file_append without '::' ignored: $spec"; continue; }
+    f=${spec%%::*}; line=${spec#*::}
+    f=${f//%compatdata%/$COMPAT}; f=${f//\$HOME/$HOME}; f=${f/#\~/$HOME}
+    mkdir -p "$(dirname "$f")" 2>/dev/null
+    if [ -z "${BACKUP[$f]:-}" ]; then
+        n=$((n + 1))
+        if [ -f "$f" ]; then cp -p "$f" "$RUN/file_append.backup.$n" && BACKUP[$f]="$RUN/file_append.backup.$n"
+        else BACKUP[$f]="-"; fi
+        [ -s "$f" ] && [ -n "$(tail -c1 "$f")" ] && echo >> "$f"   # make sure we start on a new line
+    fi
+    printf '%s\n' "$line" >> "$f" && APPENDED+=("$line") && log "file_append '$line' -> $f"
+done < <(conf_all file_append "$EXP")
+
+if [ "$(conf_get "$EXP" mangohud 1)" = 1 ]; then
+    mkdir -p "$RUN/mangohud"
+    MH="output_folder=$RUN/mangohud,log_interval=0,toggle_logging=Shift_R+F2"
+    [ "$(conf_get "$EXP" mangohud_autostart 1)" = 1 ] && MH="$MH,autostart_log=1"
+    # no_display would also disable logging (MangoHud 0.8.4), so hide the HUD with zero alpha.
+    [ "$(conf_get "$EXP" mangohud_overlay 0)" = 1 ] || MH="$MH,alpha=0,background_alpha=0"
+    export MANGOHUD=1 MANGOHUD_CONFIG="$MH"
+    log "MANGOHUD_CONFIG=$MH"
+fi
+if [ "$(conf_get "$EXP" proton_log 0)" = 1 ]; then
+    export PROTON_LOG=1 PROTON_LOG_DIR="$RUN"
+fi
+BENCH_WINDOW=$(conf_get "$EXP" bench_window "")
+
+# System facts for the manifest (cheap, read before launch)
+PROTON_DIR=""; for a in "$@"; do [[ "$a" == */proton ]] && PROTON_DIR=$(dirname "$a"); done
+PROTON_VER=$( [ -n "$PROTON_DIR" ] && head -1 "$PROTON_DIR/version" 2>/dev/null )
+GPU_DRV=$(cat /sys/module/nvidia/version 2>/dev/null || true)
+MESA=$(clean sh -c "vulkaninfo --summary 2>/dev/null | sed -n 's/.*driverInfo *= *\(Mesa.*\)/\1/p' | head -1")
+POWER=$(clean powerprofilesctl get 2>/dev/null || echo unknown)
+GOV=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)
+EPP=$(cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null)
+
+# Side tools run with a clean environment (Steam's LD_PRELOAD/LD_LIBRARY_PATH stripped).
+# exec inside the backgrounded subshell so $! is the tool itself and can be stopped by PID.
+side() { ( exec env -i HOME="$HOME" PATH="$CLEAN_PATH" "$@" ) >> "$LOG" 2>&1 & echo $!; }
+SIDE_PIDS=()
+TWN=$(conf_get "$EXP" threadwatch_name "")
+if [ "$(conf_get "$EXP" threadwatch 1)" = 1 ] && [ -x "$THREADWATCH" ]; then
+    args=(record --root $$ -o "$RUN/threadwatch" -i "$(conf_get "$EXP" threadwatch_interval 0.25)")
+    [ -n "$TWN" ] && args+=(--name "$TWN")
+    also=$(conf_get "$EXP" threadwatch_also "wineserver"); [ -n "$also" ] && args+=(--also "$also")
+    hz=$(conf_get "$EXP" threadwatch_syscalls 0); [ "$hz" != 0 ] && args+=(--syscalls "$hz")
+    SIDE_PIDS+=("$(side "$THREADWATCH" "${args[@]}")"); log "threadwatch started: ${args[*]}"
+fi
+mapfile -t REPIN < <(conf_all repin "$EXP" | sed 's/[[:space:]]*#.*$//' | grep '=>')
+if [ "${#REPIN[@]}" -gt 0 ]; then
+    RPN=$(conf_get "$EXP" repin_name "$TWN")
+    if [ -z "$RPN" ]; then log "repin rules set but no repin_name/threadwatch_name; skipped"
+    else SIDE_PIDS+=("$(side "$SELF_DIR/gamerun-repin" "$RPN" "$RUN/repin.log" "${REPIN[@]}")"); log "repin started: ${REPIN[*]}"; fi
+fi
+if [ "$(conf_get "$EXP" gtm 0)" = 1 ] && [ -x "$HOME/.local/bin/gtm" ]; then
+    SIDE_PIDS+=("$(side "$HOME/.local/bin/gtm" record -o "$RUN/gtm.jsonl")"); log "gtm started"
+fi
+
+# Sync-mode probe: once the game process is up, record ntsync / fsync / esync / server sync.
+WINE_SYSTEM_EXES='^(services|winedevice|plugplay|explorer|rpcss|svchost|tabtip|conhost|wineboot|steam|start|xalia|rundll32|winemenubuilder|mscorsvw|crashpad_handler)\.exe$'
+probe_sync() {
+    local t=0 target="" f p c
+    shopt -s nocasematch
+    while [ $t -lt 180 ] && [ -z "$target" ]; do
+        sleep 3; t=$((t + 3))
+        for f in /proc/[0-9]*/comm; do
+            p=${f#/proc/}; p=${p%/comm}; c=$(cat "$f" 2>/dev/null) || continue
+            if [ -n "$TWN" ]; then [[ "$c" =~ $TWN ]] && target=$p
+            else [[ "$c" == *.exe ]] && ! [[ "$c" =~ $WINE_SYSTEM_EXES ]] && target=$p; fi
+            [ -n "$target" ] && break
+        done
+    done
+    shopt -u nocasematch
+    [ -n "$target" ] || { echo "unknown no-target-found" > "$RUN/sync.txt"; return; }
+    sleep 10
+    [ -d "/proc/$target" ] || { echo "unknown target-exited-before-probe" > "$RUN/sync.txt"; return; }
+    holders=""
+    for p in $target $(pgrep -x wineserver); do
+        ls -l "/proc/$p/fd" 2>/dev/null | grep -q /dev/ntsync && holders="$holders,$(cat /proc/$p/comm 2>/dev/null)"
+    done
+    envs=$( { tr '\0' '\n' < "/proc/$target/environ"; } 2>/dev/null )
+    if [ -n "$holders" ]; then echo "ntsync holders=${holders#,}"
+    elif grep -qx 'WINEFSYNC=1' <<< "$envs"; then echo "fsync"
+    elif grep -qx 'WINEESYNC=1' <<< "$envs"; then echo "esync"
+    else echo "server"; fi > "$RUN/sync.txt"
+}
+probe_sync 2>> "$LOG" & SIDE_PIDS+=($!)
+
+# Run the game as a child so we can record its exit and stop the side tools.
+START=$(date +%s)
+"$@" &
+CHILD=$!
+trap 'kill -TERM $CHILD 2>/dev/null' TERM INT HUP
+
+# Hooks (e.g. benchmark automation) start after the game; they get the run dir and the display.
+HOOKS=(); HOOK_PIDS=()
+while IFS= read -r h; do
+    [ -n "$h" ] || continue
+    h=${h//\$HOME/$HOME}; h=${h/#\~/$HOME}
+    ( exec env -i HOME="$HOME" PATH="$CLEAN_PATH" DISPLAY="${DISPLAY:-}" WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
+        XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" \
+        XAUTHORITY="${XAUTHORITY:-}" XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-}" \
+        GAMERUN_RUN="$RUN" GAMERUN_APPID="$APPID" GAMERUN_LABEL="$LABEL" GAMERUN_EXPERIMENT="$NAME" \
+        GAMERUN_GAME_PID="$CHILD" bash -c "$h" ) >> "$RUN/hook.log" 2>&1 &
+    SIDE_PIDS+=($!); HOOK_PIDS+=($!); HOOKS+=("$h"); log "hook started: $h"
+done < <(conf_all hook "$EXP")
+
+wait $CHILD; RC=$?
+while kill -0 $CHILD 2>/dev/null; do wait $CHILD; RC=$?; done   # wait again if a trapped signal interrupted it
+END=$(date +%s)
+log "game exited rc=$RC after $((END - START))s"
+
+# Stop side tools: SIGINT first (threadwatch/gtm flush their files), then SIGTERM (background bash
+# ignores SIGINT), then SIGKILL. Children of hooks/probe (sleep, xdotool...) get SIGTERM too.
+stop_sides() {
+    local p sig
+    for sig in INT TERM KILL; do
+        for p in "${SIDE_PIDS[@]}"; do kill -0 "$p" 2>/dev/null && { pkill -TERM -P "$p" 2>/dev/null; kill -"$sig" "$p" 2>/dev/null; }; done
+        for _ in $(seq 8); do
+            local alive=0; for p in "${SIDE_PIDS[@]}"; do kill -0 "$p" 2>/dev/null && alive=1; done
+            [ $alive = 0 ] && return; sleep 0.25
+        done
+    done
+}
+# Hook outcome: "ok" if every hook exited 0 on its own before the game ended, else failed:<rc> or
+# killed (still running when the game exited). benchsum skips runs whose hooks did not succeed.
+HOOK_STATUS=""
+for p in "${HOOK_PIDS[@]}"; do
+    if kill -0 "$p" 2>/dev/null; then st=killed; else wait "$p"; rc=$?; [ $rc = 0 ] && st=ok || st="failed:$rc"; fi
+    [ -z "$HOOK_STATUS" ] || [ "$HOOK_STATUS" = ok ] && HOOK_STATUS=$st
+done
+[ ${#HOOK_PIDS[@]} -gt 0 ] && log "hook status: $HOOK_STATUS"
+stop_sides
+restore_files
+
+SYNC=$(cut -d' ' -f1 "$RUN/sync.txt" 2>/dev/null); SYNC_DETAIL=$(cut -d' ' -f2- -s "$RUN/sync.txt" 2>/dev/null)
+json_str() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g' | tr -d '\n'; }
+json_list() { local first=1 e; printf '['; for e in "$@"; do [ $first = 1 ] || printf ', '; printf '"%s"' "$(json_str "$e")"; first=0; done; printf ']'; }
+{
+    echo "{"
+    echo "  \"tool\": \"gamerun\", \"version\": 2,"
+    echo "  \"run_id\": \"$(json_str "$(basename "$RUN")")\","
+    echo "  \"experiment\": \"$(json_str "$NAME")\", \"label\": \"$(json_str "$LABEL")\","
+    echo "  \"notes\": \"$(json_str "$(conf_get "$EXP" notes "")")\","
+    echo "  \"appid\": \"$APPID\", \"game\": \"$(json_str "$GAME")\","
+    echo "  \"start_epoch\": $START, \"end_epoch\": $END, \"duration_s\": $((END - START)), \"exit_code\": $RC,"
+    echo "  \"proton\": \"$(json_str "$PROTON_VER")\", \"proton_dir\": \"$(json_str "$PROTON_DIR")\","
+    echo "  \"sync\": \"$(json_str "$SYNC")\", \"sync_detail\": \"$(json_str "$SYNC_DETAIL")\","
+    echo "  \"kernel\": \"$(uname -r)\", \"nvidia_driver\": \"$GPU_DRV\", \"mesa\": \"$(json_str "$MESA")\","
+    echo "  \"cpu\": \"$(json_str "$(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo | head -1)")\","
+    echo "  \"power_profile\": \"$POWER\", \"governor\": \"$GOV\", \"epp\": \"$EPP\","
+    echo "  \"gamescope\": $(printf '%s\n' "$@" | grep -q 'gamescope' && echo true || echo false),"
+    echo "  \"bench_window\": \"$(json_str "$BENCH_WINDOW")\","
+    echo "  \"env\": $(json_list "${ENV_APPLIED[@]}"),"
+    echo "  \"file_append\": $(json_list "${APPENDED[@]}"),"
+    echo "  \"hooks\": $(json_list "${HOOKS[@]}"), \"hook_status\": \"$HOOK_STATUS\","
+    echo "  \"command\": \"$(json_str "$*")\""
+    echo "}"
+} > "$RUN/manifest.json"
+
+# Summaries (best effort). benchsum uses the manifest's bench_window and writes window.json,
+# which threadwatch's summary then picks up, so both cover the same benchmark window.
+if [ -x "$BENCHSUM" ] && ls "$RUN"/mangohud/*.csv >/dev/null 2>&1; then
+    clean "$BENCHSUM" "$RUN" --write-window --runs > "$RUN/summary.txt" 2>&1
+fi
+if [ -f "$RUN/threadwatch/meta.json" ]; then
+    clean "$THREADWATCH" summary "$RUN/threadwatch" > "$RUN/threadwatch/summary.txt" 2>&1
+fi
+
+# One line per run in <results>/index.csv
+IDX="$RESULTS/index.csv"
+[ -f "$IDX" ] || echo "run_id,appid,game,experiment,label,start,duration_s,exit_code,sync,bench_window,avg_fps,frames,env,file_append,run_dir" > "$IDX"
+csvq() { printf '"%s"' "$(printf '%s' "$1" | sed 's/"/""/g')"; }
+fps=""; frames=""
+[ -f "$RUN/window.json" ] && fps=$(json_get "$RUN/window.json" avg_fps) && frames=$(json_get "$RUN/window.json" frames)
+printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$(basename "$RUN")" "$APPID" "$(csvq "$GAME")" "$(csvq "$NAME")" \
+    "$(csvq "$LABEL")" "$(date -d "@$START" '+%F %T')" "$((END - START))" "$RC" "$SYNC" "$(csvq "$BENCH_WINDOW")" "$fps" "$frames" \
+    "$(csvq "$(printf '%s | ' "${ENV_APPLIED[@]}" | sed 's/ | $//')")" "$(csvq "$(printf '%s | ' "${APPENDED[@]}" | sed 's/ | $//')")" "$(csvq "$RUN")" >> "$IDX"
+log "done: $RUN"
+exit $RC

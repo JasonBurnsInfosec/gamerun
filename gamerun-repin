@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# gamerun-repin - rewrite thread CPU affinities of a running game, by exact mask match.
+#
+#   gamerun-repin NAME_REGEX LOGFILE 'FROM=>TO' ['FROM=>TO' ...]
+#
+# Every 0.5 s, each thread of every process whose name matches NAME_REGEX (case-insensitive)
+# whose allowed-CPU list (as in /proc/<pid>/task/<tid>/status, e.g. "0-1") equals FROM exactly
+# is moved to TO with taskset. Exact matching keeps it idempotent: threads that inherit an
+# already rewritten mask are left alone. Exits when the game is gone (or on SIGTERM).
+#
+# Example (games that pin assuming Windows CPU numbering, SMT siblings adjacent, on a host
+# where siblings are N and N+16):   '0-1=>0,16'   '2-31=>1-15,17-31'
+
+NAME=$1; LOG=$2; shift 2
+declare -A RULE
+for r in "$@"; do RULE["${r%%=>*}"]=${r#*=>}; done
+declare -A DONE
+trap 'exit 0' INT TERM
+echo "[repin] watching /$NAME/ rules: $*" >> "$LOG"
+# Exits by itself once the game has been seen and is gone: gamerun's SIGINT is ignored by
+# background jobs in non-interactive bash, and bash cannot trap a signal ignored on entry.
+seen=0
+while :; do
+    pids=$(pgrep -i "$NAME")
+    if [ -n "$pids" ]; then seen=1; elif [ $seen = 1 ]; then echo "[repin] game gone, exiting" >> "$LOG"; exit 0; fi
+    for pid in $pids; do
+        for t in /proc/$pid/task/*; do
+            tid=${t##*/}
+            [ -n "${DONE[$tid]}" ] && continue
+            cur=$(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' "$t/status" 2>/dev/null) || continue
+            to=${RULE[$cur]}
+            [ -n "$to" ] || continue
+            if taskset -p -c "$to" "$tid" >/dev/null 2>&1; then
+                DONE[$tid]=1
+                echo "[repin] $(date +%T.%N | cut -c1-12) tid $tid ($(cat "$t/comm" 2>/dev/null)) $cur -> $to" >> "$LOG"
+            fi
+        done
+    done
+    sleep 0.5
+done
